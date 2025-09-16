@@ -1,8 +1,8 @@
 data:
-  train_files: hiyouga/math12k@train
-  val_files: hiyouga/math12k@test
-  prompt_key: problem
-  answer_key: answer
+  train_files: Albert-CAC/13k@train
+  val_files: Albert-CAC/13k@test
+  prompt_key: question
+  answer_key: final_answer
   image_key: images
   video_key: videos
   image_dir: null
