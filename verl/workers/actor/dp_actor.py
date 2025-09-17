@@ -30,6 +30,7 @@ from ...protocol import DataProto, batch_collate
 from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
+from ...utils.torch_functional import entropy_from_logits
 from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from ...utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from .base import BasePPOActor
@@ -125,6 +126,9 @@ class DataParallelPPOActor(BasePPOActor):
                 use_cache=False,
             )  # prevent model thinks we are generating
             logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+            V = logits_rmpad.size(-1)
+            entropy_rmpad = entropy_from_logits(logits_rmpad)            # (nnz,)
+
             logits_rmpad.div_(temperature)
             # ((total_nnz / sp) + pad)
             log_probs = self.log_probs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -133,12 +137,20 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.ulysses_size > 1:
                 # gather and unpad for the ulysses sp
                 log_probs = gather_outputs_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                entropy_rmpad = gather_outputs_and_unpad(entropy_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+
 
             # pad back to (bsz, seqlen)
             full_log_probs = pad_input(
                 hidden_states=log_probs.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
             )
             log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+
+            full_entropy = pad_input(entropy_rmpad.unsqueeze(-1), indices, batch=batch_size, seqlen=seqlen)
+            entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]      # (B,T)
+
+            # 归一化熵 h ∈ [0,1]
+            h = (entropy / math.log(float(V))).clamp(0.0, 1.0)    
         else:
             output = self.actor_module(
                 input_ids=input_ids,
@@ -147,12 +159,16 @@ class DataParallelPPOActor(BasePPOActor):
                 **multi_modal_inputs,
                 use_cache=False,
             )
+            
             logits: torch.Tensor = output.logits
+            V = logits.size(-1)
             logits.div_(temperature)
+            entropy = entropy_from_logits(logits)
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
+            h = (entropy / math.log(float(V))).clamp(0.0, 1.0)
 
-        return log_probs
+        return log_probs,h
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
@@ -206,7 +222,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+            log_probs, h = self._forward_micro_batch(model_inputs, temperature=temperature)
             log_probs_lst.append(log_probs)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
@@ -254,8 +270,19 @@ class DataParallelPPOActor(BasePPOActor):
                     advantages = model_inputs["advantages"]
 
                     # all return: (bsz, response_length)
-                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                    log_probs, h = self._forward_micro_batch(model_inputs, temperature=temperature)
 
+                    pos_mask = (advantages > 0).float()
+                    alpha = 0.03  # 0.02~0.05 起步
+
+                    f = torch.sigmoid(4.0 * (h - 0.5)) 
+
+                    w = 1.0 + alpha * f * pos_mask 
+
+                    w_sum = (w * response_mask).sum(dim=-1, keepdim=True)
+                    tok = response_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+                    w = w * tok / (w_sum + 1e-6)
+                    advantages = advantages * w.detach()
                     pg_loss, pg_metrics = compute_policy_loss(
                         old_log_probs=old_log_probs,
                         log_probs=log_probs,

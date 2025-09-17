@@ -43,7 +43,12 @@ def log_probs_from_logits_flash_attn(logits: torch.Tensor, labels: torch.Tensor)
         )
 
     return -output[0]
-
+    
+def entropy_from_logits(logits: torch.Tensor):
+    """Calculate entropy from logits."""
+    pd = torch.nn.functional.softmax(logits, dim=-1)
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    return entropy
 
 def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Compute log probs on the label ids given logits.
